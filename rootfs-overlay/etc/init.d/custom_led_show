@@ -1,0 +1,70 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+USE_PROCD=1
+
+play_lightshow() {
+	# Find all available LEDs in /sys/class/leds
+	RED=$(ls -d /sys/class/leds/*red* 2>/dev/null | head -n 1)
+	GREEN=$(ls -d /sys/class/leds/*green* 2>/dev/null | head -n 1)
+	WPS=$(ls -d /sys/class/leds/*wps* 2>/dev/null | head -n 1)
+	WLAN2G=$(ls -d /sys/class/leds/*wlan2g* 2>/dev/null | head -n 1)
+	WLAN5G=$(ls -d /sys/class/leds/*wlan5g* 2>/dev/null | head -n 1)
+
+	# Disable any active triggers during the intro show
+	for led in $RED $GREEN $WPS $WLAN2G $WLAN5G; do
+		[ -d "$led" ] && echo none > "$led/trigger" 2>/dev/null
+		[ -d "$led" ] && echo 0 > "$led/brightness" 2>/dev/null
+	done
+
+	# Light show loop: 4 cycles of color chasing
+	for i in 1 2 3 4; do
+		# 1. Solid Red
+		[ -d "$RED" ] && echo 1 > "$RED/brightness"
+		sleep 0.15
+		[ -d "$RED" ] && echo 0 > "$RED/brightness"
+
+		# 2. Solid Green
+		[ -d "$GREEN" ] && echo 1 > "$GREEN/brightness"
+		sleep 0.15
+		[ -d "$GREEN" ] && echo 0 > "$GREEN/brightness"
+
+		# 3. Amber (Red + Green simultaneously)
+		[ -d "$RED" ] && echo 1 > "$RED/brightness"
+		[ -d "$GREEN" ] && echo 1 > "$GREEN/brightness"
+		sleep 0.2
+		[ -d "$RED" ] && echo 0 > "$RED/brightness"
+		[ -d "$GREEN" ] && echo 0 > "$GREEN/brightness"
+
+		# 4. Wi-Fi / WPS sweep
+		for w in $WPS $WLAN2G $WLAN5G; do
+			[ -d "$w" ] && echo 1 > "$w/brightness"
+		done
+		sleep 0.15
+		for w in $WPS $WLAN2G $WLAN5G; do
+			[ -d "$w" ] && echo 0 > "$w/brightness"
+		done
+		sleep 0.1
+	done
+
+	# Triple strobe celebration (all LEDs strobe together)
+	for i in 1 2 3; do
+		for led in $RED $GREEN $WPS $WLAN2G $WLAN5G; do
+			[ -d "$led" ] && echo 1 > "$led/brightness"
+		done
+		sleep 0.12
+		for led in $RED $GREEN $WPS $WLAN2G $WLAN5G; do
+			[ -d "$led" ] && echo 0 > "$led/brightness"
+		done
+		sleep 0.12
+	done
+
+	# Steady-state: Rhythmic Green Heartbeat pulse (confirms custom Linux kernel is alive and humming)
+	if [ -d "$GREEN" ]; then
+		echo heartbeat > "$GREEN/trigger" 2>/dev/null || echo 1 > "$GREEN/brightness"
+	fi
+}
+
+start_service() {
+	play_lightshow &
+}

@@ -1,0 +1,69 @@
+#!/bin/sh
+# udhcpc script for the WISP uplink (wlan0).
+#
+# Differences from /usr/share/udhcpc/default.script:
+#  - installs its default route with metric 20 and NEVER deletes other
+#    default routes, so the wired WAN's metric-10 route survives every
+#    renewal (failover);
+#  - publishes the lease DNS to /tmp/resolv.conf.d/wisp.auto and, when no
+#    wired default route exists, also to resolv.conf.auto for dnsmasq.
+[ -z "$1" ] && exit 1
+
+RESOLV_DIR=/tmp/resolv.conf.d
+WISP_DNS=$RESOLV_DIR/wisp.auto
+RESOLV=$RESOLV_DIR/resolv.conf.auto
+METRIC=20
+
+has_wired_default() {
+	ip route show default 2>/dev/null | grep -q ' dev lan4 '
+}
+
+write_dns() {
+	mkdir -p "$RESOLV_DIR"
+	old=$(cat "$RESOLV" 2>/dev/null)
+	{
+		for ns in $dns; do
+			echo "nameserver $ns"
+		done
+		[ -n "$dns" ] || for ns in $router; do
+			echo "nameserver $ns"
+		done
+	} > "$WISP_DNS"
+	chmod 644 "$WISP_DNS"
+	if ! has_wired_default; then
+		cp "$WISP_DNS" "$RESOLV"
+		chmod 644 "$RESOLV"
+		[ "$old" = "$(cat "$RESOLV")" ] || /etc/init.d/dnsmasq restart >/dev/null 2>&1
+	fi
+}
+
+case "$1" in
+	deconfig)
+		ip -4 addr flush dev "$interface" 2>/dev/null
+		while ip route del default dev "$interface" metric "$METRIC" 2>/dev/null; do :; done
+		if ! has_wired_default; then
+			old=$(cat "$RESOLV" 2>/dev/null)
+			: > "$RESOLV"
+			chmod 644 "$RESOLV"
+			[ -z "$old" ] || /etc/init.d/dnsmasq restart >/dev/null 2>&1
+		fi
+		;;
+	bound|renew)
+		ip addr add "$ip/${subnet:-255.255.255.0}" broadcast "${broadcast:-+}" dev "$interface" 2>/dev/null
+		for gw in $router; do
+			[ "$gw" = "0.0.0.0" ] && continue
+			[ "$gw" = "255.255.255.255" ] && continue
+			ip route replace default via "$gw" dev "$interface" metric "$METRIC"
+		done
+		if [ -n "$staticroutes" ]; then
+			max=128
+			while [ -n "$1" ] && [ -n "$2" ] && [ "$max" -gt 0 ]; do
+				ip route add "$1" via "$2" dev "$interface" 2>/dev/null
+				shift 2
+				max=$((max - 1))
+			done
+		fi
+		write_dns
+		;;
+esac
+exit 0

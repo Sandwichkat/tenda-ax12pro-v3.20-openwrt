@@ -1,0 +1,11 @@
+#!/bin/sh
+# Failover DNS: when the wired WAN goes down, fall back to the WISP lease DNS
+# captured by /usr/share/udhcpc/wisp.script.  When the wired WAN comes up,
+# netifd's DHCP script rewrites resolv.conf.auto itself.
+[ "$INTERFACE" = "wan" ] || exit 0
+[ "$ACTION" = "ifdown" ] || exit 0
+[ -s /tmp/resolv.conf.d/wisp.auto ] || exit 0
+old=$(cat /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null)
+cp /tmp/resolv.conf.d/wisp.auto /tmp/resolv.conf.d/resolv.conf.auto
+chmod 644 /tmp/resolv.conf.d/resolv.conf.auto
+[ "$old" = "$(cat /tmp/resolv.conf.d/resolv.conf.auto)" ] || /etc/init.d/dnsmasq restart >/dev/null 2>&1

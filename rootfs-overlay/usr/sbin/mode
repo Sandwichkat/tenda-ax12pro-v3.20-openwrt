@@ -1,0 +1,341 @@
+#!/bin/sh
+# Operating-mode manager for the Tenda AX12 Pro V3.2.
+#
+# Phase 1: mode store, boot-time effective network config, pending state,
+# rollback watcher and red-LED helpers.  WISP is the only mode accepted by
+# `apply` until the per-mode service logic lands; `boot` writes the effective
+# network config for the selected mode.
+#
+# Ports on this board: lan4 = WAN jack (PHY5); lan1..lan3 = LAN jacks.
+# The DT 'wan' netdev has no jack and is never used.
+set -u
+
+MODE_CFG=mode
+LED=$(ls -d /sys/class/leds/*red* 2>/dev/null | head -n1)
+
+log_msg() {
+	echo "MODE: $*" > /dev/console
+	logger -t mode "$*" 2>/dev/null
+}
+
+get_mode() {
+	uci -q get mode.mode.current || echo wisp
+}
+
+get_selected() {
+	uci -q get mode.mode.selected || get_mode
+}
+
+get_pending() {
+	uci -q get mode.mode.pending || echo 0
+}
+
+get_timeout() {
+	local t
+	t=$(uci -q get mode.mode.confirm_timeout)
+	case "$t" in ''|*[!0-9]*) t=120 ;; esac
+	echo "$t"
+}
+
+find_brdev() {
+	local i=0 name
+	while uci -q get "network.@device[$i]" >/dev/null 2>&1; do
+		name=$(uci -q get "network.@device[$i].name")
+		if [ "$name" = "br-lan" ]; then
+			echo "@device[$i]"
+			return 0
+		fi
+		i=$((i + 1))
+	done
+	echo "@device[0]"
+}
+
+led_off() {
+	[ -n "$LED" ] && [ -d "$LED" ] || return 0
+	echo none > "$LED/trigger" 2>/dev/null
+	echo 0 > "$LED/brightness" 2>/dev/null
+}
+
+led_slow() {
+	[ -n "$LED" ] && [ -d "$LED" ] || return 0
+	echo timer > "$LED/trigger" 2>/dev/null
+	echo 500 > "$LED/delay_on" 2>/dev/null
+	echo 500 > "$LED/delay_off" 2>/dev/null
+}
+
+led_fast() {
+	[ -n "$LED" ] && [ -d "$LED" ] || return 0
+	echo timer > "$LED/trigger" 2>/dev/null
+	echo 150 > "$LED/delay_on" 2>/dev/null
+	echo 150 > "$LED/delay_off" 2>/dev/null
+}
+
+# Write the effective network config for $1 (the mode name).
+write_network() {
+	local m=$1 brdev ports p wan_disabled=1 lan_ip lan_mask
+	local wproto wip wmask wgw wdns wmetric
+
+	brdev=$(find_brdev)
+	case "$m" in
+		router|failover) ports="lan1 lan2 lan3" ;;
+		*)               ports="lan1 lan2 lan3 lan4" ;;
+	esac
+
+	case "$m" in
+		ap)
+			lan_ip=$(uci -q get mode.ap.mgmt_ip)
+			[ -n "$lan_ip" ] || lan_ip=192.168.1.1
+			lan_mask=$(uci -q get mode.ap.mgmt_netmask)
+			[ -n "$lan_mask" ] || lan_mask=255.255.255.0
+			;;
+		router|failover)
+			# Router/failover LAN can be moved off 192.168.1.0/24 when
+			# the upstream uses the same subnet.
+			lan_ip=$(uci -q get mode.router.lan_ip)
+			[ -n "$lan_ip" ] || lan_ip=192.168.1.1
+			lan_mask=$(uci -q get mode.router.lan_netmask)
+			[ -n "$lan_mask" ] || lan_mask=255.255.255.0
+			;;
+		*)
+			lan_ip=192.168.1.1
+			lan_mask=255.255.255.0
+			;;
+	esac
+
+	uci -q delete "network.$brdev.ports"
+	for p in $ports; do
+		uci add_list "network.$brdev.ports=$p"
+	done
+
+	uci set network.lan.device=br-lan
+	uci set network.lan.proto=static
+	uci set network.lan.ipaddr="$lan_ip"
+	uci set network.lan.netmask="$lan_mask"
+	uci -q delete network.lan.gateway
+	uci -q delete network.lan.dns
+
+	case "$m" in
+		router|failover)
+			wan_disabled=0
+			wproto=$(uci -q get mode.wired.proto)
+			case "$wproto" in dhcp|static) ;; *) wproto=dhcp ;; esac
+			wmetric=$(uci -q get mode.wired.metric)
+			case "$wmetric" in ''|*[!0-9]*) wmetric=10 ;; esac
+			;;
+		*)
+			wan_disabled=1
+			wproto=dhcp
+			wmetric=10
+			;;
+	esac
+
+	uci set network.wan.device=lan4
+	uci set network.wan.proto="$wproto"
+	uci set network.wan.metric="$wmetric"
+	if [ "$wan_disabled" = 1 ]; then
+		uci set network.wan.disabled=1
+	else
+		uci -q delete network.wan.disabled
+	fi
+	if [ "$wan_disabled" = 0 ] && [ "$wproto" = static ]; then
+		wip=$(uci -q get mode.wired.ipaddr)
+		wmask=$(uci -q get mode.wired.netmask)
+		wgw=$(uci -q get mode.wired.gateway)
+		wdns=$(uci -q get mode.wired.dns)
+		[ -n "$wip" ] && uci set network.wan.ipaddr="$wip" || uci -q delete network.wan.ipaddr
+		[ -n "$wmask" ] && uci set network.wan.netmask="$wmask" || uci -q delete network.wan.netmask
+		[ -n "$wgw" ] && uci set network.wan.gateway="$wgw" || uci -q delete network.wan.gateway
+		uci -q delete network.wan.dns
+		for d in $wdns; do uci add_list network.wan.dns="$d"; done
+	else
+		uci -q delete network.wan.ipaddr
+		uci -q delete network.wan.netmask
+		uci -q delete network.wan.gateway
+		uci -q delete network.wan.dns
+	fi
+
+	uci set network.wan6.device=lan4
+	uci set network.wan6.disabled=1
+
+	case "$m" in
+		wisp)     uci set network.globals.curmode=repeater ;;
+		router|failover) uci set network.globals.curmode=router ;;
+		ap)       uci set network.globals.curmode=bridge ;;
+	esac
+
+	uci commit network
+}
+
+# Service side of a mode.  The wlan0 association is kept in every mode
+# (wifi_pre) as the chip keepalive; only DHCP/addresses/routes and the wired
+# WAN change here.  Never use /etc/init.d/network restart: it runs
+# `wifi down; ifdown -a` and kills br-lan/APs.
+apply_services() {
+	local m=$1
+	case "$m" in
+		wisp)
+			# Re-add lan4 to br-lan, drop the wired WAN, resume the
+			# STA DHCP client and the br-lan DHCP server.
+			ubus call network reload >/dev/null 2>&1
+			ifdown wan 2>/dev/null
+			/usr/sbin/wisp-dhcp start
+			/usr/sbin/wisp-sta dhcp-start
+			;;
+		router)
+			# Stop the STA lease/default, keep the association, enable
+			# the wired WAN and the br-lan DHCP server.
+			/usr/sbin/wisp-sta dhcp-stop
+			/usr/sbin/wisp-dhcp start
+			ubus call network reload >/dev/null 2>&1
+			ifup wan 2>/dev/null
+			;;
+		ap)
+			# Dumb AP: no STA lease, no local DHCP; the upstream
+			# router serves the bridged clients.
+			/usr/sbin/wisp-sta dhcp-stop
+			/usr/sbin/wisp-dhcp stop
+			ubus call network reload >/dev/null 2>&1
+			ifdown wan 2>/dev/null
+			;;
+		failover)
+			# Both uplinks: wired WAN metric 10, WISP STA DHCP
+			# metric 20 (wisp.script never deletes foreign routes).
+			/usr/sbin/wisp-dhcp start
+			ubus call network reload >/dev/null 2>&1
+			ifup wan 2>/dev/null
+			/usr/sbin/wisp-sta dhcp-start
+			;;
+		*)
+			log_msg "service logic for mode '$m' not implemented yet"
+			return 1
+			;;
+	esac
+	return 0
+}
+
+do_boot() {
+	local m
+	if [ "$(get_pending)" = "1" ]; then
+		local prev
+		prev=$(uci -q get mode.mode.previous)
+		[ -n "$prev" ] || prev=wisp
+		log_msg "unconfirmed mode change at boot -> rollback to $prev"
+		uci set mode.mode.current="$prev"
+		uci set mode.mode.selected="$prev"
+		uci set mode.mode.pending=0
+		uci set mode.mode.deadline=0
+		uci commit mode
+		# Wait for the vendor light show (custom_led_show, S99) before signaling.
+		( sleep 6; led_fast; sleep 5; led_off ) &
+		m=$prev
+	else
+		m=$(get_mode)
+		# Keep the desired selection aligned with the active mode unless an
+		# apply is pending (a saved-but-unapplied selection is discarded).
+		if [ "$(uci -q get mode.mode.selected)" != "$m" ]; then
+			uci set mode.mode.selected="$m"
+			uci commit mode
+		fi
+	fi
+	write_network "$m"
+	log_msg "boot mode=$m (network config written)"
+}
+
+do_apply() {
+	local sel old timeout now
+	sel=$(get_selected)
+	[ -n "$sel" ] || sel=$(get_mode)
+	case "$sel" in
+		wisp|router|ap|failover) ;;
+		*)
+			log_msg "apply refused: unknown mode '$sel'"
+			return 1
+			;;
+	esac
+	if [ "$(get_pending)" = "1" ]; then
+		log_msg "apply refused: a change is pending confirm/rollback"
+		return 1
+	fi
+	old=$(get_mode)
+	timeout=$(get_timeout)
+	now=$(date +%s)
+	uci set mode.mode.pending=1
+	uci set mode.mode.previous="$old"
+	uci set mode.mode.deadline=$((now + timeout))
+	uci commit mode
+	led_slow
+	write_network "$sel"
+	apply_services "$sel" || {
+		log_msg "apply failed; rolling back"
+		do_rollback
+		return 1
+	}
+	uci set mode.mode.current="$sel"
+	uci commit mode
+	# The persistent watcher is a procd service (/etc/init.d/mode_watch).
+	log_msg "applied mode=$sel (was $old), confirm within ${timeout}s"
+}
+
+do_confirm() {
+	uci set mode.mode.pending=0
+	uci set mode.mode.deadline=0
+	uci commit mode
+	led_off
+	log_msg "mode change confirmed"
+}
+
+do_rollback() {
+	local prev
+	prev=$(uci -q get mode.mode.previous)
+	[ -n "$prev" ] || prev=wisp
+	log_msg "rollback to mode=$prev"
+	uci set mode.mode.current="$prev"
+	uci set mode.mode.selected="$prev"
+	uci set mode.mode.pending=0
+	uci set mode.mode.deadline=0
+	uci commit mode
+	write_network "$prev"
+	apply_services "$prev" || true
+	( led_fast; sleep 5; led_off ) &
+}
+
+# Persistent watcher, run by the procd service /etc/init.d/mode_watch.  It
+# loops forever (procd respawns it if killed) and only acts while a mode change
+# is pending and its deadline has passed.
+do_watch() {
+	local pending deadline now
+	while :; do
+		pending=$(get_pending)
+		if [ "$pending" = "1" ]; then
+			deadline=$(uci -q get mode.mode.deadline)
+			now=$(date +%s)
+			if [ -n "$deadline" ] && [ "$now" -ge "$deadline" ]; then
+				log_msg "confirmation timeout -> rollback"
+				do_rollback
+			fi
+		fi
+		sleep 5
+	done
+}
+
+case "${1:-status}" in
+	boot)     do_boot ;;
+	apply)    do_apply ;;
+	confirm)  do_confirm ;;
+	rollback) do_rollback ;;
+	watch)    do_watch ;;
+	status)
+		dl=$(uci -q get mode.mode.deadline)
+		case "$dl" in ''|*[!0-9]*) dl=0 ;; esac
+		rem=$((dl - $(date +%s)))
+		[ "$rem" -lt 0 ] && rem=0
+		echo "current=$(get_mode) selected=$(get_selected) pending=$(get_pending) previous=$(uci -q get mode.mode.previous) deadline=$dl remaining=$rem"
+		;;
+	led-pending) led_slow ;;
+	led-rollback) led_fast ;;
+	led-off) led_off ;;
+	*)
+		echo "usage: $0 {boot|apply|confirm|rollback|watch|status|led-pending|led-rollback|led-off}" >&2
+		exit 1
+		;;
+esac

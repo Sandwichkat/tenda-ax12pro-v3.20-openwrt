@@ -1,0 +1,23 @@
+config mode 'mode'
+	option current 'wisp'
+	option selected 'wisp'
+	option pending '0'
+	option previous ''
+	option deadline '0'
+	option confirm_timeout '120'
+
+config wired 'wired'
+	option proto 'dhcp'
+	option ipaddr ''
+	option netmask ''
+	option gateway ''
+	option dns ''
+	option metric '10'
+
+config router 'router'
+	option lan_ip '192.168.1.1'
+	option lan_netmask '255.255.255.0'
+
+config ap 'ap'
+	option mgmt_ip '192.168.1.1'
+	option mgmt_netmask '255.255.255.0'

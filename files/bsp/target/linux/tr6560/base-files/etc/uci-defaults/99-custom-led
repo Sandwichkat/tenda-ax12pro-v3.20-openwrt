@@ -1,0 +1,4 @@
+#!/bin/sh
+/etc/init.d/custom_led_show enable
+/etc/init.d/custom_led_show start
+exit 0

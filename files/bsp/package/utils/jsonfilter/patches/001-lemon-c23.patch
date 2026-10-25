@@ -1,0 +1,10 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,7 +23,7 @@
+ ADD_CUSTOM_COMMAND(
+   OUTPUT contrib/lemon
+   DEPENDS contrib/lemon.c contrib/lempar.c
+-  COMMAND gcc -o contrib/lemon contrib/lemon.c
++  COMMAND gcc -std=gnu17 -o contrib/lemon contrib/lemon.c
+   COMMENT "Generating lemon parser generator"
+ )

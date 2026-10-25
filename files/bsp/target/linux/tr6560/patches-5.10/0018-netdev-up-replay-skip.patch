@@ -1,0 +1,15 @@
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1832,7 +1832,11 @@
+ 	if (!(dev->flags & IFF_UP))
+ 		return 0;
+ 
+-	call_netdevice_notifier(nb, NETDEV_UP, dev);
++	/* Tenda/Triductor tri_kcfe_res registers its notifier before
++	 * INIT_LIST_HEAD; replaying NETDEV_UP for an already-UP netdev
++	 * (wlan0) dereferences a NULL list head.  Do not replay UP on
++	 * registration; the driver will receive the next real UP event. */
++	/* call_netdevice_notifier(nb, NETDEV_UP, dev); */
+ 	return 0;
+ }
+ 

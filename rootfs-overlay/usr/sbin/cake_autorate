@@ -1,0 +1,177 @@
+#!/bin/sh
+# cake_autorate - adapt CAKE bandwidth on the WISP uplink from RTT + load.
+#
+# Control loop (about 1 Hz, ash/busybox only):
+#   * ping the reflector (1.1.1.1) and track the idle baseline RTT
+#   * read wlan0 rx/tx byte counters to know which direction is loaded
+#   * if loaded and RTT is above baseline + THRESH_MS: reduce that direction
+#   * if loaded and RTT is below baseline + RECOVER_MS: increase it slowly
+#   * idle: hold the learned rates (do not ramp back to max in the dark)
+#
+# Rates are in kbit/s.  State is written to /tmp/cake_autorate.state.
+# The qdiscs are created by /etc/init.d/sqm_cake; if they disappear this
+# script waits for them to come back instead of exiting.
+
+REFLECTOR=1.1.1.1
+
+DOWN_MIN=12000
+DOWN_MAX=42000
+UP_MIN=4000
+UP_MAX=20000
+
+THRESH_MS=20		# reduce when rtt > base + this
+RECOVER_MS=5		# increase when rtt < base + this
+COOLDOWN=4		# cycles to wait after a reduction before increasing
+IDLE_BYTES=50000	# bytes per cycle below which the link is "idle"
+DIR_RATIO=4		# a direction is "dominant" if it carries DIR_RATIO x
+STEP_DOWN=88		# percent on reduction
+STEP_UP=105		# percent on increase
+ROUND_KBIT=500
+
+STATE=/tmp/cake_autorate.state
+
+log() { logger -t cake_autorate "$*"; }
+
+read_rtt() {
+	ping -c 1 -W 1 "$REFLECTOR" 2>/dev/null | \
+		sed -n 's/.*round-trip min\/avg\/max = [0-9.]*\/\([0-9.]*\)\/.*/\1/p'
+}
+
+round() { echo $(( ($1 / ROUND_KBIT) * ROUND_KBIT )); }
+
+clamp() {
+	[ "$DOWN" -lt "$DOWN_MIN" ] && DOWN=$DOWN_MIN
+	[ "$DOWN" -gt "$DOWN_MAX" ] && DOWN=$DOWN_MAX
+	[ "$UP" -lt "$UP_MIN" ] && UP=$UP_MIN
+	[ "$UP" -gt "$UP_MAX" ] && UP=$UP_MAX
+	DOWN=$(round "$DOWN")
+	UP=$(round "$UP")
+}
+
+apply() {
+	tc qdisc change dev ifb0 root cake bandwidth "${DOWN}kbit" nat 2>/dev/null || return 1
+	tc qdisc change dev wlan0 root cake bandwidth "${UP}kbit" nat 2>/dev/null || return 1
+	return 0
+}
+
+# start from the rates the qdiscs were created with
+DOWN=36000
+UP=16000
+# 0 forces the first cycle to apply these rates, so the controller and the
+# qdiscs cannot disagree after a restart.
+last_down=0
+last_up=0
+base=
+fail=0
+cooldown=0
+changes=0
+
+log "start (rtt reflector $REFLECTOR, down ${DOWN}kbit, up ${UP}kbit)"
+
+# Seed the baseline with a few quiet-path samples (ignored if the WAN is
+# still down; the main loop will initialise on the first successful ping).
+i=0
+while [ "$i" -lt 5 ]; do
+	rtt=$(read_rtt)
+	case "$rtt" in ''|*[!0-9.]*) rtt=;; esac
+	if [ -n "$rtt" ]; then
+		rtt=${rtt%%.*}
+		[ -z "$base" ] && base=$rtt
+		[ "$rtt" -lt "$base" ] && base=$rtt
+	fi
+	i=$((i + 1))
+	sleep 1
+done
+[ -n "$base" ] && log "baseline ${base}ms"
+
+while :; do
+	if ! tc qdisc show dev wlan0 2>/dev/null | grep -q 'cake'; then
+		log "cake qdisc missing on wlan0; waiting"
+		sleep 5
+		continue
+	fi
+
+	r0=$(cat /sys/class/net/wlan0/statistics/rx_bytes)
+	t0=$(cat /sys/class/net/wlan0/statistics/tx_bytes)
+
+	rtt=$(read_rtt)
+	sleep 1
+
+	r1=$(cat /sys/class/net/wlan0/statistics/rx_bytes)
+	t1=$(cat /sys/class/net/wlan0/statistics/tx_bytes)
+	rx=$((r1 - r0))
+	tx=$((t1 - t0))
+	load=$((rx + tx))
+
+	case "$rtt" in
+	''|*[!0-9.]*) rtt=;;
+	esac
+
+	if [ -z "$rtt" ]; then
+		# No RTT sample (WAN not up yet, or a lost packet).  This is not
+		# evidence of queueing: hold the rates and try again.
+		fail=$((fail + 1))
+		if [ $((fail % 30)) -eq 1 ]; then
+			log "ping failed ${fail}x (holding ${DOWN}/${UP} kbit)"
+		fi
+		echo "rtt=timeout fail=$fail rx=$rx tx=$tx down=$DOWN up=$UP" > "$STATE"
+		continue
+	fi
+	fail=0
+	rtt=${rtt%%.*}
+
+	if [ -z "$base" ]; then base=$rtt; fi
+
+	if [ "$load" -lt "$IDLE_BYTES" ]; then
+		# Idle: let the baseline follow the quiet-path RTT.
+		base=$(( (base * 3 + rtt) / 4 ))
+	else
+		# Loaded: the baseline may only fall, so sustained queueing
+		# cannot drag the reference up.
+		[ "$rtt" -lt "$base" ] && base=$rtt
+	fi
+	excess=$(( rtt - base ))
+
+	if [ "$cooldown" -gt 0 ]; then cooldown=$((cooldown - 1)); fi
+
+	# Which direction is carrying the load?  A download shows up as rx,
+	# an upload as tx; adjust only the dominant one unless both are busy.
+	do_down=1
+	do_up=1
+	if [ "$load" -ge "$IDLE_BYTES" ]; then
+		if [ "$rx" -gt $((tx * DIR_RATIO)) ]; then
+			do_up=0
+		elif [ "$tx" -gt $((rx * DIR_RATIO)) ]; then
+			do_down=0
+		fi
+	fi
+
+	if [ "$load" -lt "$IDLE_BYTES" ]; then
+		: # idle: hold the learned rates
+	elif [ "$excess" -gt "$THRESH_MS" ]; then
+		[ "$do_down" = 1 ] && DOWN=$((DOWN * STEP_DOWN / 100))
+		[ "$do_up" = 1 ] && UP=$((UP * STEP_DOWN / 100))
+		cooldown=$COOLDOWN
+	elif [ "$excess" -lt "$RECOVER_MS" ] && [ "$cooldown" -eq 0 ]; then
+		[ "$do_down" = 1 ] && DOWN=$((DOWN * STEP_UP / 100))
+		[ "$do_up" = 1 ] && UP=$((UP * STEP_UP / 100))
+	fi
+	clamp
+
+	if [ "$DOWN" != "$last_down" ] || [ "$UP" != "$last_up" ]; then
+		if apply; then
+			last_down=$DOWN
+			last_up=$UP
+			changes=$((changes + 1))
+			if [ $((changes % 10)) -eq 1 ] || [ "$excess" -gt 100 ]; then
+				log "rtt=${rtt} base=${base} excess=${excess} rx=${rx} tx=${tx} -> down=${DOWN}kbit up=${UP}kbit"
+			fi
+		else
+			log "tc change failed; keeping ${last_down}/${last_up}"
+			DOWN=$last_down
+			UP=$last_up
+		fi
+	fi
+
+	echo "rtt=$rtt base=$base excess=$excess rx=$rx tx=$tx down=$DOWN up=$UP" > "$STATE"
+done

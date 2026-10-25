@@ -1,0 +1,18 @@
+{
+	"luci-app-wisp": {
+		"description": "Grant access to Wi-Fi / WISP configuration and status",
+		"read": {
+			"uci": [ "wisp" ],
+			"file": {
+				"/tmp/dhcp.leases": [ "read" ]
+			},
+			"ubus": {
+				"iwinfo": [ "info", "assoclist", "freqlist", "txpowerlist", "countrylist" ],
+				"hostapd.*": [ "get_status", "get_clients" ]
+			}
+		},
+		"write": {
+			"uci": [ "wisp" ]
+		}
+	}
+}

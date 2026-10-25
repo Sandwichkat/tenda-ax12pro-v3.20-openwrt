@@ -1,0 +1,33 @@
+#!/bin/sh
+# WISP uplink DHCP client helpers.
+#
+# The wlan0 association itself is kept up by wifi_pre in every mode as the
+# chip keepalive (the chip watchdog is fed by MAC activity).  Only the DHCP
+# client / address / default route is mode-specific: wisp and failover run it,
+# router and AP modes do not.
+
+find_udhcpc() {
+	ps w 2>/dev/null | awk '/udhcpc/ && /wlan0/ && !/awk/ {print $1}'
+}
+
+case "${1:-status}" in
+	dhcp-start)
+		[ -n "$(find_udhcpc)" ] && exit 0
+		( udhcpc -i wlan0 -T 3 -A 10 -s /usr/share/udhcpc/wisp.script > /tmp/dhcp.log 2>&1 & )
+		;;
+	dhcp-stop)
+		for p in $(find_udhcpc); do
+			kill "$p" 2>/dev/null
+		done
+		ip -4 addr flush dev wlan0 2>/dev/null
+		ip route flush dev wlan0 2>/dev/null
+		;;
+	status)
+		p=$(find_udhcpc)
+		[ -n "$p" ] && echo "udhcpc running pid=$p" || echo "udhcpc stopped"
+		;;
+	*)
+		echo "usage: $0 {dhcp-start|dhcp-stop|status}" >&2
+		exit 1
+		;;
+esac

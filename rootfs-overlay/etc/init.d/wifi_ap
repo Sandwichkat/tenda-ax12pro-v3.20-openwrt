@@ -1,0 +1,258 @@
+#!/bin/sh /etc/rc.common
+# Wi-Fi APs: 5 GHz on phy1 (wlan1) + 2.4 GHz on phy0 (wlan2, alongside the
+# WISP uplink STA wlan0) + br-lan DHCP.  RAM image only; flash untouched.
+# Runs after wifi_net (S21).
+#
+# Vendor-driver bring-up (2026-10-22 live-tested): each AP vif must pass
+# through hostapd START once BEFORE its MAC is changed and hostapd restarted.
+# Setting the MAC first and starting hostapd only once leaves the driver's
+# netdev/VAP map bound to the wrong state: the AP beacons, but the client's
+# auth/EAPOL frames never reach hostapd.
+#
+# Minimal proven sequence (2 s between phases is sufficient):
+#   phase 1: create vif + start hostapd (driver-assigned MAC), wait AP-ENABLED
+#   phase 2: vif down, set MAC = <br-lan MAC + offset>, restart hostapd
+# The old T+360/T+480 fixed timers were unnecessary; the ordering was the
+# requirement, not the absolute uptime.  Cold-boot AP ready at ~39 s.
+# /tmp/ap_ready (5 GHz) is touched only after both APs are up.
+START=22
+
+# Generated files contain the AP PSK; keep them root-only.
+umask 077
+
+CONF5=/tmp/hostapd_wlan1.conf
+CONF2=/tmp/hostapd_wlan2.conf
+
+# Build the 5 GHz hostapd config from /etc/config/wisp (editable in LuCI ->
+# Network -> Wi-Fi / WISP).  Only the non-DFS 5 GHz channels are offered.
+gen_conf_5g() {
+    local ssid psk chan width center chwidth ht vcenter hcenter
+    ssid=$(uci -q get wisp.ap.ssid)
+    [ -n "$ssid" ] || ssid="TetOS"
+    psk=$(uci -q get wisp.ap.psk)
+    [ -n "$psk" ] || { echo "WIFI_AP: wisp.ap.psk missing" > /dev/console; return 1; }
+    chan=$(uci -q get wisp.ap.channel)
+    [ -n "$chan" ] || chan=149
+    width=$(uci -q get wisp.ap.width)
+    [ -n "$width" ] || width=80
+
+    case "$width" in
+        20)
+            chwidth=0; ht="[SHORT-GI-20]"; center=""
+            ;;
+        40)
+            chwidth=0; ht="[HT40+][SHORT-GI-20][SHORT-GI-40]"
+            case "$chan" in
+                149|153) center=151 ;;
+                157|161) center=159 ;;
+                *) width=80; center="" ;;
+            esac
+            ;;
+        *)
+            width=80; center=""
+            ;;
+    esac
+    if [ "$width" = 80 ]; then
+        chwidth=1; center=155
+        ht="[HT40+][SHORT-GI-20][SHORT-GI-40]"
+    fi
+    vcenter=""; hcenter=""
+    if [ -n "$center" ]; then
+        vcenter="vht_oper_centr_freq_seg0_idx=$center"
+        hcenter="he_oper_centr_freq_seg0_idx=$center"
+    fi
+
+    cat > "$CONF5" <<EOF
+interface=wlan1
+driver=nl80211
+ssid=$ssid
+hw_mode=a
+channel=$chan
+ieee80211d=0
+ieee80211h=0
+ieee80211n=1
+ht_capab=$ht
+ieee80211ac=1
+vht_oper_chwidth=$chwidth
+$vcenter
+ieee80211ax=1
+he_oper_chwidth=$chwidth
+$hcenter
+wpa=2
+wpa_passphrase=$psk
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+auth_algs=1
+EOF
+    echo "WIFI_AP: config 5g ssid=$ssid ch=$chan width=$width" > /dev/console
+}
+
+# 2.4 GHz AP on phy0, same SSID/PSK, on the uplink STA's channel (20 MHz) so
+# the single 2.4 GHz radio can serve both roles (stock repeater behaviour).
+gen_conf_2g() {
+    local ssid psk chan mode
+    ssid=$(uci -q get wisp.ap.ssid)
+    [ -n "$ssid" ] || ssid="TetOS"
+    psk=$(uci -q get wisp.ap.psk)
+    [ -n "$psk" ] || { echo "WIFI_AP: wisp.ap.psk missing" > /dev/console; return 1; }
+    # WISP/failover follow the uplink STA channel; wired router/AP modes have
+    # no guaranteed uplink channel, so use the configured 2.4 GHz channel.
+    mode=$(uci -q get mode.mode.current)
+    [ -n "$mode" ] || mode=wisp
+    case "$mode" in
+        router|ap)
+            chan=$(uci -q get wisp.ap.channel2g)
+            [ -n "$chan" ] || chan=11
+            ;;
+        *)
+            chan=$(iw dev wlan0 info 2>/dev/null | awk '/channel/{print $2; exit}')
+            [ -n "$chan" ] || chan=$(uci -q get wisp.ap.channel2g)
+            [ -n "$chan" ] || chan=11
+            ;;
+    esac
+
+    cat > "$CONF2" <<EOF
+interface=wlan2
+driver=nl80211
+ssid=$ssid
+hw_mode=g
+channel=$chan
+ieee80211d=0
+ieee80211h=0
+ieee80211n=1
+ht_capab=[SHORT-GI-20]
+ieee80211ax=1
+he_oper_chwidth=0
+he_oper_centr_freq_seg0_idx=$chan
+wpa=2
+wpa_passphrase=$psk
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+auth_algs=1
+EOF
+    echo "WIFI_AP: config 2g ssid=$ssid ch=$chan width=20" > /dev/console
+}
+
+ap_start() {
+    local ifc=$1 conf=$2 pidf=$3 log=$4
+    if [ ! -x /usr/sbin/hostapd ] || [ ! -f "$conf" ]; then
+        return 1
+    fi
+    if [ -s "$pidf" ] && \
+       kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
+        kill "$(cat "$pidf")" 2>/dev/null
+        sleep 1
+    fi
+    # Keep 0/1/2 open: with a closed/redirected stdio the hostapd netlink
+    # socket can land on fd 2, which the -B daemonization then replaces with
+    # /dev/null; select() on /dev/null is always readable and hostapd spins on
+    # recvfrom -> ENOTSOCK ("netlink: recvfrom failed: Not a socket").
+    /usr/sbin/hostapd -B -P "$pidf" -f "$log" "$conf" \
+        0</dev/null 1>/dev/null 2>&1
+    ip link set "$ifc" master br-lan 2>/dev/null
+    ip link set "$ifc" up 2>/dev/null
+}
+
+# Wait until hostapd logs AP-ENABLED after line $2 (up to 20 s).
+wait_ap_enabled() {
+    local log=$1 from=$2 i=0
+    while [ $i -lt 40 ]; do
+        tail -n +$((from + 1)) "$log" 2>/dev/null | \
+            grep -q "AP-ENABLED" && return 0
+        sleep 0.5; i=$((i+1))
+    done
+    return 1
+}
+
+# Two-phase vif bring-up (see the header comment).  $6 is the MAC offset
+# relative to br-lan (5 GHz uses +2, 2.4 GHz uses +1, as stock does).
+two_phase_ap() {
+    local phy=$1 ifc=$2 conf=$3 pidf=$4 log=$5 off=$6 tp=${7:-30} n base last apmac
+    if ! iw dev "$ifc" info >/dev/null 2>&1; then
+        iw phy "$phy" interface add "$ifc" type __ap 2>/dev/null || {
+            echo "WIFI_AP: $ifc create failed" > /dev/console; return 1; }
+    fi
+    [ -f "$log" ] && n=$(wc -l < "$log") || n=0
+    ap_start "$ifc" "$conf" "$pidf" "$log" || return 1
+    wait_ap_enabled "$log" "$n"
+    echo "WIFI_AP: $ifc phase 1 hostapd start (vif registered)" > /dev/console
+    sleep 2
+
+    kill "$(cat "$pidf" 2>/dev/null)" 2>/dev/null
+    sleep 1
+    ip link set "$ifc" down 2>/dev/null
+    base=$(cat /sys/class/net/br-lan/address 2>/dev/null)
+    if [ -n "$base" ]; then
+        last=${base##*:}
+        apmac=${base%:*}:$(printf '%02x' $((0x$last + off)))
+        ip link set "$ifc" address "$apmac" 2>/dev/null
+    fi
+    [ -f "$log" ] && n=$(wc -l < "$log") || n=0
+    ap_start "$ifc" "$conf" "$pidf" "$log" || return 1
+    wait_ap_enabled "$log" "$n"
+
+    # The driver defaults to 0 dBm unless TX power is set explicitly (stock's
+    # netifd path does `iw phy ... set txpower fixed`).  30 dBm is the hard
+    # cap this stack accepts (36 dBm -> EPERM); the board/FW TPC clamps the
+    # actual PA to its calibrated ceiling (~25 dBm).  txpower comes from
+    # /etc/config/wisp (LuCI), clamped to 0..30.
+    iw phy "$phy" set txpower fixed $((tp * 100)) 2>/dev/null
+    iw dev "$ifc" set txpower fixed $((tp * 100)) 2>/dev/null
+    echo "WIFI_AP: $ifc phase 2 final AP up ($(cat /sys/class/net/$ifc/address 2>/dev/null)) txpower ${tp}dBm" > /dev/console
+}
+
+start() {
+    (
+        i=0
+        while [ $i -lt 60 ]; do
+            [ -e /tmp/wifi_ready ] && [ -d /sys/class/ieee80211/phy1 ] && break
+            sleep 1; i=$((i+1))
+        done
+        [ -d /sys/class/ieee80211/phy1 ] || {
+            echo "WIFI_AP: phy1 missing, giving up" > /dev/console; exit 1; }
+
+        # ch149 AP needs a regdomain that permits it (AU in this build).
+        iw reg set AU 2>/dev/null
+
+        # Materialise /etc/config/wisp into hostapd configs.
+        gen_conf_5g || exit 1
+        gen_conf_2g || exit 1
+
+        # Optional settings from LuCI (/etc/config/wisp).
+        txp=$(uci -q get wisp.ap.txpower)
+        case "$txp" in ''|*[!0-9]*) txp=30 ;; esac
+        [ "$txp" -gt 30 ] && txp=30
+        band2g=$(uci -q get wisp.ap.band2g)
+        [ -z "$band2g" ] && band2g=1
+
+        # 5 GHz first (the proven path), then 2.4 GHz beside the uplink STA.
+        two_phase_ap phy1 wlan1 "$CONF5" /tmp/hostapd_wlan1.pid \
+            /tmp/hostapd_wlan1.log 2 "$txp"
+        if [ "$band2g" != "0" ]; then
+            two_phase_ap phy0 wlan2 "$CONF2" /tmp/hostapd_wlan2.pid \
+                /tmp/hostapd_wlan2.log 1 "$txp"
+        else
+            # Runtime disable: tear down any 2.4 GHz AP left from before.
+            kill "$(cat /tmp/hostapd_wlan2.pid 2>/dev/null)" 2>/dev/null
+            ip link set wlan2 down 2>/dev/null
+            iw dev wlan2 del 2>/dev/null
+            echo "WIFI_AP: 2.4 GHz AP disabled by config" > /dev/console
+        fi
+
+        # DHCP for AP clients (separate instance from netifd's DNS-only one).
+        # AP/bridge mode must not run a local DHCP server: the upstream router
+        # serves the bridged clients.
+        MODE=$(uci -q get mode.mode.current)
+        [ -n "$MODE" ] || MODE=wisp
+        if [ "$MODE" != "ap" ]; then
+            /usr/sbin/wisp-dhcp start
+        else
+            echo "WIFI_AP: AP/bridge mode, local DHCP disabled" > /dev/console
+        fi
+
+        touch /tmp/ap_ready
+        echo "WIFI_AP: APs ready at $(cut -d. -f1 /proc/uptime)s" > /dev/console
+    ) &
+}
+
+stop() { :; }

@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# DHCP-only dnsmasq for br-lan.  wifi_ap also starts it; this init exists so a
+# LuCI DHCP Save & Apply (ucitrack -> dnsmasq reload) refreshes the static-host
+# file and restarts the custom server.  AP/bridge mode must not run it.
+START=22
+
+start() {
+	[ "$(uci -q get mode.mode.current)" = "ap" ] && return 0
+	/usr/sbin/wisp-dhcp start
+}
+
+stop() {
+	/usr/sbin/wisp-dhcp stop
+}
+
+reload() {
+	stop
+	sleep 1
+	start
+}

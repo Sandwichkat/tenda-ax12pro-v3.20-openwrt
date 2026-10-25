@@ -1,0 +1,161 @@
+diff --git a/feeds/luci/modules/luci-base/src/Makefile b/feeds/luci/modules/luci-base/src/Makefile
+index 2a425d5a..0bd4f11a 100644
+--- a/feeds/luci/modules/luci-base/src/Makefile
++++ b/feeds/luci/modules/luci-base/src/Makefile
+@@ -2,7 +2,7 @@
+ 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FPIC) -DNDEBUG -c -o $@ $<
+ 
+ contrib/lemon: contrib/lemon.c contrib/lempar.c
+-	cc -o contrib/lemon $<
++	gcc -std=gnu17 -o contrib/lemon $<
+ 
+ plural_formula.c: plural_formula.y contrib/lemon
+ 	./contrib/lemon -q $<
+diff --git a/package/network/services/uhttpd/files/uhttpd.config b/package/network/services/uhttpd/files/uhttpd.config
+index a9b8ff3d..4bb2c346 100644
+--- a/package/network/services/uhttpd/files/uhttpd.config
++++ b/package/network/services/uhttpd/files/uhttpd.config
+@@ -10,7 +10,7 @@ config uhttpd main
+ 	list listen_https	[::]:443
+ 
+ 	# Redirect HTTP requests to HTTPS if possible
+-	option redirect_https	0
++	option redirect_https	1
+ 
+ 	# Server document root
+ 	option home		/www
+diff --git a/package/network/services/uhttpd/files/uhttpd.init b/package/network/services/uhttpd/files/uhttpd.init
+index 8dbc23f5..638f542f 100755
+--- a/package/network/services/uhttpd/files/uhttpd.init
++++ b/package/network/services/uhttpd/files/uhttpd.init
+@@ -60,6 +60,7 @@ generate_keys() {
+ 			-subj /C="${country:-ZZ}"/ST="${state:-Somewhere}"/L="${location:-Unknown}"/O="${organization:-OpenWrt$UNIQUEID}"/CN="${commonname:-OpenWrt}"
+ 		sync
+ 		mv "${UHTTPD_KEY}.new" "${UHTTPD_KEY}"
++		chmod 600 "${UHTTPD_KEY}"
+ 		mv "${UHTTPD_CERT}.new" "${UHTTPD_CERT}"
+ 	}
+ }
+diff --git a/package/triductor/start-boot_6560/Makefile b/package/triductor/start-boot_6560/Makefile
+index 966c416c..bbcd6d65 100644
+--- a/package/triductor/start-boot_6560/Makefile
++++ b/package/triductor/start-boot_6560/Makefile
+@@ -64,6 +64,12 @@ ifeq ($(CONFIG_TARGET_PROFILE),"DEVICE_THG6400PR-TAC2")
+         SUFFIX:=AX
+ endif
+ 
++ifeq ($(CONFIG_TARGET_PROFILE),"DEVICE_tenda_ax12pro_v3")
++        SUFFIX:=AX
++endif
++
++SUFFIX?=AX
++
+ define Build/Prepare
+ 	$(CP) ./* $(PKG_BUILD_DIR)/
+ endef
+diff --git a/rules.mk b/rules.mk
+index 303718c3..40bba38f 100644
+--- a/rules.mk
++++ b/rules.mk
+@@ -239,8 +239,8 @@ export PKG_CONFIG
+ HOSTCC:=gcc
+ HOSTCXX:=g++
+ HOST_CPPFLAGS:=-I$(STAGING_DIR_HOST)/include $(if $(IS_PACKAGE_BUILD),-I$(STAGING_DIR_HOSTPKG)/include -I$(STAGING_DIR)/host/include)
+-HOST_CXXFLAGS:=
+-HOST_CFLAGS:=-O2 $(HOST_CPPFLAGS)
++HOST_CXXFLAGS:=-O2 -std=gnu++11 $(HOST_CPPFLAGS)
++HOST_CFLAGS:=-O2 -std=gnu17 $(HOST_CPPFLAGS)
+ HOST_LDFLAGS:=-L$(STAGING_DIR_HOST)/lib $(if $(IS_PACKAGE_BUILD),-L$(STAGING_DIR_HOSTPKG)/lib -L$(STAGING_DIR)/host/lib)
+ 
+ ifeq ($(CONFIG_EXTERNAL_TOOLCHAIN),)
+diff --git a/target/linux/tr6560/base-files/etc/modules-boot.d/05-tri_bsp b/target/linux/tr6560/base-files/etc/modules-boot.d/05-tri_bsp
+deleted file mode 120000
+index cfef0d01..00000000
+--- a/target/linux/tr6560/base-files/etc/modules-boot.d/05-tri_bsp
++++ /dev/null
+@@ -1 +0,0 @@
+-../modules.d/05-tri_bsp
+\ No newline at end of file
+diff --git a/target/linux/tr6560/base-files/etc/modules.d/05-tri_bsp b/target/linux/tr6560/base-files/etc/modules.d/05-tri_bsp
+deleted file mode 100644
+index c77763ef..00000000
+--- a/target/linux/tr6560/base-files/etc/modules.d/05-tri_bsp
++++ /dev/null
+@@ -1,14 +0,0 @@
+-tri_wdg
+-tri_basic
+-tri_sdk_l0
+-tri_sdk_l1
+-tri_sdk_l2
+-tri_kphy
+-tri_kport
+-tri_sdk_hal
+-tri_dfx
+-tri_kcfe_res
+-tri_pcie
+-tri_kcfe_mc
+-tri_cpufreq
+-tri_kphy_ext
+diff --git a/target/linux/tr6560/image/Makefile b/target/linux/tr6560/image/Makefile
+index 5af69bfb..bb9fe654 100644
+--- a/target/linux/tr6560/image/Makefile
++++ b/target/linux/tr6560/image/Makefile
+@@ -164,8 +164,17 @@ ifeq ($(SUBTARGET),generic)
+   TARGET_DEVICES += THG6500-TAX2 THG6400-TAC2 THG6500P-TAX2
+ endif
+ 
++define Device/tenda_ax12pro_v3
++  DEVICE_VENDOR := Tenda
++  DEVICE_MODEL := AX12 Pro V3.2
++  DEVICE_DTS := tenda-ax12pro-v3
++  DEVICE_PACKAGES := tr5220-eFEM-tr6560
++  $(Device/$(SUBTARGET))
++  IMAGES := sysupgrade.bin
++endef
++
+ ifeq ($(SUBTARGET),norflash)
+-  TARGET_DEVICES += THG6500R-TAX2 THG6400R-TAC2 THG6400PR-TAC2 THG6500PR-TAX2
++  TARGET_DEVICES += THG6500R-TAX2 THG6400R-TAC2 THG6400PR-TAC2 THG6500PR-TAX2 tenda_ax12pro_v3
+ endif
+ 
+ $(eval $(call BuildImage))
+diff --git a/target/linux/tr6560/norflash/config-5.10 b/target/linux/tr6560/norflash/config-5.10
+index 346aa64c..1ac3d9c4 100755
+--- a/target/linux/tr6560/norflash/config-5.10
++++ b/target/linux/tr6560/norflash/config-5.10
+@@ -286,7 +286,7 @@ CONFIG_MTD_SPI_NOR_USE_4K_SECTORS=y
+ # CONFIG_MTD_SPLIT_SQUASHFS_ROOT is not set
+ CONFIG_MTD_SPLIT_UIMAGE_FW=y
+ CONFIG_MTD_TRIDUCTOR=y
+-CONFIG_MTD_TRIDUCTOR_NAND=y
++# CONFIG_MTD_TRIDUCTOR_NAND is not set
+ CONFIG_MTD_TRIDUCTOR_NOR=y
+ CONFIG_MUTEX_SPIN_ON_OWNER=y
+ CONFIG_NAMESPACES=y
+diff --git a/toolchain/gcc/common.mk b/toolchain/gcc/common.mk
+index bef4fa37..a87a06ed 100644
+--- a/toolchain/gcc/common.mk
++++ b/toolchain/gcc/common.mk
+@@ -171,6 +171,8 @@ GCC_MAKE:= \
+ 	export SHELL="$(BASH)"; \
+ 	$(MAKE) \
+ 		CFLAGS="$(HOST_CFLAGS)" \
++		CXXFLAGS="$(HOST_CXXFLAGS)" \
++		CXXFLAGS_FOR_BUILD="$(HOST_CXXFLAGS)" \
+ 		CFLAGS_FOR_TARGET="$(TARGET_CFLAGS)" \
+ 		CXXFLAGS_FOR_TARGET="$(TARGET_CFLAGS)" \
+ 		GOCFLAGS_FOR_TARGET="$(TARGET_CFLAGS)"
+diff --git a/tools/cmake/Makefile b/tools/cmake/Makefile
+index 4391586b..fd59c139 100644
+--- a/tools/cmake/Makefile
++++ b/tools/cmake/Makefile
+@@ -25,7 +25,8 @@ HOST_CONFIGURE_VARS += \
+ 	CC="$(HOSTCC_NOCACHE)" \
+ 	CXX="$(HOSTCXX_NOCACHE)" \
+ 	MAKEFLAGS="$(HOST_JOBS)" \
+-	CXXFLAGS="$(HOST_CFLAGS)" \
++	CFLAGS="$(HOST_CFLAGS)" \
++	CXXFLAGS="$(HOST_CXXFLAGS)" \
+ 	MAKE="$(STAGING_DIR_HOST)/bin/ninja"
+ 
+ HOST_CONFIGURE_ARGS := \

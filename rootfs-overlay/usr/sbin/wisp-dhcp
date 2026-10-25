@@ -1,0 +1,60 @@
+#!/bin/sh
+# DHCP-only dnsmasq for br-lan (the netifd dnsmasq is DNS-only in this image).
+# Used in wisp/router/failover modes; AP/bridge mode must not run it.
+PID=/tmp/dnsmasq_brlan.pid
+LANIP=$(uci -q get network.lan.ipaddr)
+[ -n "$LANIP" ] || LANIP=192.168.1.1
+PREFIX=${LANIP%.*}
+
+running() {
+	[ -s "$PID" ] && kill -0 "$(cat "$PID" 2>/dev/null)" 2>/dev/null
+}
+
+case "${1:-status}" in
+	start)
+		running && exit 0
+		# dnsmasq drops privileges (nobody); the netifd DNS instance owns
+		# /tmp/dhcp.leases as root:root 0644, so make it writable before
+		# starting.  LuCI's Active DHCP Leases reads this same file.
+		[ -e /tmp/dhcp.leases ] || : > /tmp/dhcp.leases
+		chmod 666 /tmp/dhcp.leases 2>/dev/null
+		# Static leases from the UCI dhcp host sections (LuCI Set Static).
+		HOSTS=/tmp/dhcp_hosts
+		: > "$HOSTS"
+		uci -q show dhcp 2>/dev/null | sed -n 's/^dhcp\.\([^.]*\)=host$/\1/p' | while read -r s; do
+			mac=$(uci -q get "dhcp.$s.mac" 2>/dev/null)
+			ip=$(uci -q get "dhcp.$s.ip" 2>/dev/null)
+			name=$(uci -q get "dhcp.$s.name" 2>/dev/null)
+			[ -n "$mac" ] || continue
+			printf '%s' "$mac"
+			[ -n "$ip" ] && printf ',%s' "$ip"
+			[ -n "$name" ] && printf ',%s' "$name"
+			printf '\n'
+		done > "$HOSTS" 2>/dev/null
+		chmod 644 "$HOSTS"
+		exec dnsmasq --interface=br-lan --bind-interfaces \
+			--dhcp-range="$PREFIX.100,$PREFIX.199,255.255.255.0,12h" \
+			--dhcp-option=3,"$LANIP" --dhcp-option=6,"$LANIP" \
+			--no-resolv --no-hosts --port=0 --log-dhcp \
+			--log-facility=/tmp/dnsmasq_dhcp.log \
+			--pid-file="$PID" --dhcp-leasefile=/tmp/dhcp.leases \
+			--dhcp-hostsfile="$HOSTS" --dhcp-authoritative
+		;;
+	stop)
+		if running; then
+			kill "$(cat "$PID")" 2>/dev/null
+		fi
+		rm -f "$PID"
+		;;
+	status)
+		if running; then
+			echo "running pid=$(cat "$PID") lan=$LANIP"
+		else
+			echo "stopped"
+		fi
+		;;
+	*)
+		echo "usage: $0 {start|stop|status}" >&2
+		exit 1
+		;;
+esac

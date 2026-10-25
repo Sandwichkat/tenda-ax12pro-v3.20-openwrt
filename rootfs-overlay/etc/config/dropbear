@@ -1,0 +1,7 @@
+config dropbear
+	option PasswordAuth 'on'
+	option RootPasswordAuth 'on'
+	option Port         '22'
+	# 1,504-byte pre-auth art (fits MAX_BANNER_SIZE 2050); /etc/profile is
+	# guarded with SSH_CONNECTION so SSH does not print it twice.
+	option BannerFile   '/etc/banner'

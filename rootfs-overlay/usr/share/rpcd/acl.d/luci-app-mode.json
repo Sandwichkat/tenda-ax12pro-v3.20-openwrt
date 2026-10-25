@@ -1,0 +1,14 @@
+{
+	"luci-app-mode": {
+		"description": "Grant access to operating-mode configuration and apply/rollback",
+		"read": {
+			"uci": [ "mode" ]
+		},
+		"write": {
+			"uci": [ "mode" ],
+			"file": {
+				"/usr/sbin/mode": [ "exec" ]
+			}
+		}
+	}
+}

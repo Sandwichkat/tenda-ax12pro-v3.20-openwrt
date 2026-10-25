@@ -1,0 +1,159 @@
+#!/bin/sh /etc/rc.common
+# WiFi bring-up (RAM image).  All work is RAM-only; flash is never touched.
+#
+# Modes:
+#  - default: S15, before tri_eth_up (S19).  The tri Ethernet stack leaves
+#    CRG+0x20 bits 4/24 set, which stops the TR5220 endpoint from ever
+#    presenting a receiver, so the PCIe link must be trained first.
+#  - /etc/wifi_after_eth present: Ethernet-first experiment.  tri_eth_up
+#    runs normally; this script waits for /tmp/eth_ready, clears CRG+0x20
+#    bits 4/24, then loads tri_pcie and the peanut stack.
+START=15
+
+# Generated files contain the uplink PSK; keep them root-only.
+umask 077
+
+# Materialise /etc/config/wisp into a wpa_supplicant config.
+# Testable standalone:  . /etc/init.d/wifi_pre && gen_wpa_conf
+gen_wpa_conf() {
+    local ssid psk fb_ssid fb_psk
+    ssid=$(uci -q get wisp.uplink.ssid)
+    [ -n "$ssid" ] || { echo "WIFI_PRE: wisp.uplink.ssid missing" > /dev/console; return 1; }
+    psk=$(uci -q get wisp.uplink.psk)
+    [ -n "$psk" ] || { echo "WIFI_PRE: wisp.uplink.psk missing" > /dev/console; return 1; }
+    fb_ssid=$(uci -q get wisp.uplink.fallback_ssid)
+    fb_psk=$(uci -q get wisp.uplink.fallback_psk)
+    {
+        echo "ctrl_interface=/var/run/wpa_supplicant"
+        echo "ap_scan=1"
+        echo "network={"
+        echo "	ssid=\"$ssid\""
+        echo "	psk=\"$psk\""
+        echo "}"
+        if [ -n "$fb_ssid" ] && [ -n "$fb_psk" ]; then
+            echo "network={"
+            echo "	ssid=\"$fb_ssid\""
+            echo "	psk=\"$fb_psk\""
+            echo "}"
+        fi
+    } > /tmp/wpa.conf
+}
+
+start_peanut() {
+    # The driver picks the model ini by efuse chip id (ours 0x186 -> T)
+    # and hardcodes /etc/wifi/cfg_vspm3xx_T.ini (g_ini_file_name does not
+    # override it).  Load the external-FEM variant with fem_flag=0x3 there.
+    cp -f /etc/wifi/cfg_vspm3xx_board.ini /etc/wifi/cfg_vspm3xx_T.ini
+
+    # Vendor userspace peer: peanut_plat registers netlink protocol 28
+    # early in its init, then sdt_drv_main_init waits for app_sdt.
+    ( sleep 1; /usr/sbin/app_sdt > /tmp/sdt.log 2>&1 & ) &
+    ( sleep 2; i=0; while [ $i -lt 20 ]; do
+          insmod /lib/modules/5.10.138/wifi_kick.ko host_log=1 sw=0 \
+                 2>/dev/null && break
+          sleep 1; i=$((i+1)); done ) &
+    insmod /lib/modules/5.10.138/peanut_plat.ko
+    sleep 1
+    /usr/sbin/app_nlc > /tmp/nlc.log 2>&1 &
+    /usr/sbin/app_acs > /tmp/acs.log 2>&1 &
+    sleep 1
+    insmod /lib/modules/5.10.138/compat.ko 2>/dev/null
+    insmod /lib/modules/5.10.138/cfg80211.ko 2>/dev/null
+    insmod /lib/modules/5.10.138/peanut_wifi.ko
+
+    # Start the MAC and associate immediately: the chip watchdog is fed by
+    # MAC activity (beacons); an idle MAC stops heartbeats in ~1-2 s.
+    iw phy phy0 interface add wlan0 type managed 2>/dev/null
+    ip link set wlan0 up
+    echo "WIFI_PRE: wlan0 UP" > /dev/console
+    mkdir -p /var/run/wpa_supplicant
+    if gen_wpa_conf; then
+        # Same fd-2/netlink guard as wifi_ap: keep stdio fds occupied so the
+        # daemonization cannot replace a low-numbered netlink socket.
+        /usr/sbin/wpa_supplicant -B -i wlan0 -c /tmp/wpa.conf -f /tmp/wpa.log \
+            0</dev/null 1>/dev/null 2>&1
+        echo "WIFI_PRE: wpa_supplicant started" > /dev/console
+        ( sleep 8
+          iw dev wlan0 link > /tmp/link.txt 2>&1
+          wpa_cli -i wlan0 status > /tmp/wpa_status.txt 2>&1
+          touch /tmp/wifi_ready
+          echo "WIFI_PRE: assoc snapshot taken" > /dev/console
+          # Persistent DHCP client only in WISP/failover.  Router/AP modes keep
+          # the association (chip keepalive via beacons) but install no address
+          # or default route, so netifd owns the wired WAN.
+          MODE=$(uci -q get mode.mode.current)
+          [ -n "$MODE" ] || MODE=wisp
+          case "$MODE" in
+              wisp|failover)
+                  exec udhcpc -i wlan0 -T 3 -A 10 -s /usr/share/udhcpc/wisp.script > /tmp/dhcp.log 2>&1
+                  ;;
+              *)
+                  echo "WIFI_PRE: mode=$MODE, STA keepalive only (no DHCP)" > /dev/console
+                  ;;
+          esac
+        ) &
+    else
+        # Generic release image: no uplink configured yet.  Keep the APs and
+        # Ethernet usable for first-time setup; the STA association (and its
+        # chip-watchdog keepalive) starts after the user configures WISP.
+        echo "WIFI_PRE: no WISP uplink configured; AP-only bring-up" > /dev/console
+        touch /tmp/wifi_ready
+    fi
+    dmesg > /tmp/wifi_pre.log
+    echo "WIFI_PRE: done" > /dev/console
+}
+
+start() {
+    echo 7 > /proc/sys/kernel/printk
+    echo "WIFI_PRE: begin" > /dev/console
+
+    mkdir -p /tmp/wifi_pre
+    cp -f /etc/wifi/FIRMWARE.bin /tmp/wifi_pre/FIRMWARE.bsp.bin
+    cp -f /etc/wifi/cfg_device.ini /tmp/wifi_pre/cfg_device.bsp.ini
+    echo "WIFI_PRE: using BSP firmware (baked /etc/wifi)" > /dev/console
+    md5sum /etc/wifi/FIRMWARE.bin /etc/wifi/cfg_device.ini > /tmp/wifi_pre/files.txt
+
+    dmesg -c >/dev/null 2>&1
+
+    if [ -e /etc/wifi_after_eth ]; then
+        echo "WIFI_PRE: after-eth mode, waiting for /tmp/eth_ready" > /dev/console
+        (
+            i=0
+            while [ ! -e /tmp/eth_ready ] && [ $i -lt 60 ]; do
+                sleep 1; i=$((i+1))
+            done
+            echo "WIFI_PRE: eth_ready, clearing CRG+0x20 bits 4/24" > /dev/console
+            echo "clear 0x14880020 0x01000010" > /proc/ethdbg
+            echo "raw 0x14880020" > /proc/ethdbg
+            insmod /lib/modules/5.10.138/tri_pcie.ko || \
+                echo "WIFI_PRE: tri_pcie insmod FAILED" > /dev/console
+            insmod /lib/wifi_test/tr5220_wdt.ko pet_ms=10000 2>/dev/null || \
+                insmod /lib/wifi_test/tr5220_wdt.ko
+            echo 'set 0x1016102c 0x00800000' > /proc/ethdbg
+            echo 'set 0x1016502c 0x00800000' > /proc/ethdbg
+            echo 'set 0x50000004 0x00000146' > /proc/ethdbg
+            echo 'set 0x68000004 0x00000146' > /proc/ethdbg
+            start_peanut
+        ) &
+        return 0
+    fi
+
+    # Default mode: train the PCIe link before tri_eth_up runs.
+    insmod /lib/modules/5.10.138/tri_wdg.ko || echo "WIFI_PRE: tri_wdg insmod FAILED" > /dev/console
+    insmod /lib/modules/5.10.138/tri_basic.ko || echo "WIFI_PRE: tri_basic insmod FAILED" > /dev/console
+    insmod /lib/modules/5.10.138/tri_pcie.ko || echo "WIFI_PRE: tri_pcie insmod FAILED" > /dev/console
+    insmod /lib/wifi_test/tr5220_wdt.ko pet_ms=10000 2>/dev/null || insmod /lib/wifi_test/tr5220_wdt.ko
+
+    # Retail hi_pcie sets APB+0x2c bit23 (mask_link_timeout_flush_not_irq).
+    # EP Bus Master Enable (PCI command bit 2) on both channels.
+    insmod /lib/eth/ethdbg.ko 2>/dev/null
+    echo 'set 0x1016102c 0x00800000' > /proc/ethdbg
+    echo 'set 0x1016502c 0x00800000' > /proc/ethdbg
+    echo 'set 0x50000004 0x00000146' > /proc/ethdbg
+    echo 'set 0x68000004 0x00000146' > /proc/ethdbg
+
+    echo "WIFI_PRE: links up, starting peanut stack (background)" > /dev/console
+    start_peanut &
+}
+
+stop() { :; }

@@ -1,0 +1,16 @@
+
+config uplink 'uplink'
+	option ssid ''
+	option psk ''
+	option fallback_ssid ''
+	option fallback_psk ''
+
+config ap 'ap'
+	option channel '149'
+	option width '80'
+	option band2g '1'
+	option txpower '30'
+	option channel2g '11'
+	option ssid 'TetOS'
+	option psk 'changeme'
+

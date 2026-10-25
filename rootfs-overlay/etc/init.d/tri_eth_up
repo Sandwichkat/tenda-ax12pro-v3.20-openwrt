@@ -1,0 +1,84 @@
+#!/bin/sh /etc/rc.common
+# Triductor tri-SDK Ethernet bring-up for the RAM (initramfs) environment.
+#
+# Proven recipe (scripts/eth_bringup.py / TR5220_HANDOFF_NOTES §15.6).
+# START must be before network (START=20) so lan1-4/wan exist when netifd
+# builds br-lan.
+#
+# Why each step matters:
+#  - CRG+0x30 bits 0,1,3,4 (LSW resets) must be deasserted before tri_sdk_l2,
+#    otherwise the switch core reads bus poison 0x89abcdef and l2 init fails.
+#  - tri_kcfe_res.ko crashes at insmod if any netdev is IFF_UP (notifier
+#    registered before its list head is initialized) -> bring eth0+lo down.
+#  - hcall_tri_port_power_up_all_cmd un-isolates the 5 PHYs (BMCR 0x1940).
+#  - 0x1100001c = 0x00018000 is the CPU data-path enable in the DP block;
+#    the tri driver never writes it, retail's hsan driver does.
+#  - The vendor cs_cli init installs the ingress flow rule (ifc_set) that
+#    lets frames reach/leave the CPU port; qos_mode_set/lrn_setcfg mirror
+#    /etc/init.d/tri_setup.
+
+START=19
+
+start() {
+	local m i
+
+	# Test hook: keep Ethernet down so wlan0 can stay UP (tri_kcfe_res
+	# NULL-derefs if any netdev is UP when it loads).
+	[ -e /etc/wifi_only_test ] && return 0
+
+	# The TR5220 PCIe endpoint must finish link training and firmware load
+	# before this script writes CRG+0x30: those clock changes make the
+	# endpoint stop presenting a receiver, so a chip that has not trained
+	# yet never will.  wifi_pre (S15) creates /tmp/wifi_ready once the
+	# peanut stack has reached device_ready.  In the Ethernet-first
+	# experiment (/etc/wifi_after_eth) there is no such wait: wifi_pre
+	# trains the link after this script finishes.
+	if [ ! -e /etc/wifi_after_eth ]; then
+		i=0
+		while [ ! -e /tmp/wifi_ready ] && [ $i -lt 30 ]; do
+			sleep 1
+			i=$((i+1))
+		done
+	fi
+
+	# 1. debug/poke module + LSW reset gate (must precede tri_sdk_l2)
+	insmod /lib/eth/ethdbg.ko 2>/dev/null
+	echo 'set 0x14880030 0xfe7fe05b' > /proc/ethdbg
+
+	# 2. tri stack, order matters
+	for m in tri_wdg tri_sdk_l0 tri_basic tri_sdk_l1; do
+		insmod /lib/modules/5.10.138/$m.ko
+	done
+	insmod /lib/modules/5.10.138/tri_sdk_l2.ko
+	for m in tri_kphy tri_kport tri_sdk_hal; do
+		insmod /lib/modules/5.10.138/$m.ko
+	done
+
+	# 3. interface layer: eth0/lo must be DOWN at insmod (init-order bug).
+	#    wlan0 may stay UP: the kernel patch to net/core/dev.c stops the
+	#    NETDEV_UP replay that used to hit tri_kcfe_res's uninitialised
+	#    notifier list.
+	ip link set eth0 down 2>/dev/null
+	ip link set lo down 2>/dev/null
+	insmod /lib/modules/5.10.138/tri_kcfe_res.ko
+	ip link set lo up
+	ip link set eth0 up 2>/dev/null
+
+	# 4. PHY power-up (clear BMCR isolate)
+	/lib/eth/trihlp hcall_tri_port_power_up_all_cmd 0
+
+	# 5. DP CPU-path enable (tri driver omits it)
+	echo 'set 0x1100001c 0x00018000' > /proc/ethdbg
+
+	# 6. vendor userspace init
+	/lib/eth/cs_cli /home/cli/api/hal/qos/qos_mode_set -v mode 0
+	/lib/eth/cs_cli /home/cli/api/protocol/cfe/lrn/lrn_setcfg -v enable 1 lrnmode 1 lrn 5 br 1 echo_acc_en 1 ipv6_acc_en 1 agemode 0 age 1
+	/lib/eth/cs_cli /home/cli/api/hal/flow/ifc_set -v cnt_en 1 fwd_act_en 1 fwd_act 7 frame_en 1 frame 2 igr 0x200
+
+	# Signal wifi_pre (/etc/wifi_after_eth mode) that Ethernet is fully up.
+	touch /tmp/eth_ready
+}
+
+stop() {
+	:
+}

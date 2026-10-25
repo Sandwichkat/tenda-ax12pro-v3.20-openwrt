@@ -1,0 +1,19 @@
+# Local build inputs/outputs -- never publish these.
+/bsp/
+/out/
+/vendor/
+/cal/
+/logs/
+*.bin
+*.squashfs
+*.ko
+*.kv
+*.cal
+*.o
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+__pycache__/
+/private/

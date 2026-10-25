@@ -1,0 +1,17 @@
+#!/bin/sh /etc/rc.common
+# Operating-mode boot preparation.  Runs before wifi_pre (S15), tri_eth_up
+# (S19) and netifd (S20), writing the effective network config for the
+# selected mode.  No services are started here; the normal boot scripts do
+# that.  `reload` is available for CLI apply (the LuCI page calls the manager
+# directly).
+START=14
+
+start() {
+	/usr/sbin/mode boot
+}
+
+reload() {
+	/usr/sbin/mode apply
+}
+
+stop() { :; }

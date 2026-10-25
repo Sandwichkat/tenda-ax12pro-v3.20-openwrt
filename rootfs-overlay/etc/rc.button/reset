@@ -1,0 +1,41 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+OVERLAY="$( grep ' /overlay ' /proc/mounts )"
+
+case "$ACTION" in
+pressed)
+	[ -z "$OVERLAY" ] && return 0
+
+	return 5
+;;
+timeout)
+	. /etc/diag.sh
+	set_state failsafe
+;;
+released)
+	# An unconfirmed mode change: a short press rolls it back immediately
+	# instead of rebooting.  The LED has been blinking while pending.
+	if [ -x /usr/sbin/mode ] && \
+	   [ "$(uci -q get mode.mode.pending)" = "1" ] && \
+	   [ "$SEEN" -lt 5 ]
+	then
+		echo "MODE ROLLBACK (reset button)" > /dev/console
+		/usr/sbin/mode rollback
+		return 0
+	fi
+	if [ "$SEEN" -lt 1 ]
+	then
+		echo "REBOOT" > /dev/console
+		sync
+		reboot
+	elif [ "$SEEN" -ge 5 -a -n "$OVERLAY" ]
+	then
+		echo "FACTORY RESET" > /dev/console
+		jffs2reset -y && reboot &
+	fi
+;;
+esac
+
+return 0

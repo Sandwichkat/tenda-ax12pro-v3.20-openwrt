@@ -1,0 +1,48 @@
+
+config system
+	option ttylogin '0'
+	option urandom_seed '0'
+	option hostname 'OpenWrt'
+	option zonename 'Australia/Melbourne'
+	option timezone 'AEST-10AEDT,M10.1.0,M4.1.0/3'
+	option log_proto 'udp'
+	option conloglevel '8'
+	option cronloglevel '5'
+	option log_size '512'
+
+config timeserver 'ntp'
+	list server '0.openwrt.pool.ntp.org'
+	list server '1.openwrt.pool.ntp.org'
+	list server '2.openwrt.pool.ntp.org'
+	list server '3.openwrt.pool.ntp.org'
+
+config led 'led_2g'
+	option name '2g'
+	option sysfs 'tri:green:wlan2g'
+	option trigger 'custom'
+
+config led 'led_5g'
+	option name '5g'
+	option sysfs 'tri:green:wlan5g'
+	option trigger 'custom'
+
+config led 'led_normal'
+	option name 'normal'
+	option sysfs 'tri:green:power'
+	option trigger 'default-on'
+
+config led 'led_abnormal'
+	option name 'abnormal'
+	option sysfs 'tri:red:power'
+	option trigger 'custom'
+
+config led 'led_wps'
+	option name 'wps'
+	option sysfs 'tri:green:wps'
+	option trigger 'custom'
+
+config led 'led_mesh'
+	option name 'mesh'
+	option sysfs 'tri:green:wps'
+	option trigger 'custom'
+

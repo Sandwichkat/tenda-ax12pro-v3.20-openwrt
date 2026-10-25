@@ -1,0 +1,215 @@
+/*
+ * Device Tree for Tenda AX12 Pro V3.2 (Triductor TR6560 + TR5220)
+ *
+ * Preserves factory calibration partition at 0xd0000 (256 KB)
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+#include "triductor-tr6560.dtsi"
+
+/ {
+	model = "Tenda AX12 Pro V3.2";
+	compatible = "tenda,ax12pro-v3", "THG6500-TAX2", "triductor,tr6560";
+
+	aliases {
+		serial0 = "/uart@0x1010f000";
+		serial1 = "/uart@0x1010e000";
+	};
+
+	memory {
+		device_type = "memory";
+		reg = <0x80500000 0x07b00000>;
+	};
+
+	/delete-node/ reserved-memory;
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		flashinfo@0x80600000 {
+			compatible = "hsan,flashinfo_reserved";
+			reg = <0x80600000 0x4000>;
+			atag-offset = <0x1000>;
+		};
+	};
+
+	chosen {
+		bootargs = "console=ttyS0,115200 earlycon rootfstype=ramfs";
+		stdout-path = "serial0:115200n8";
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		wlan_sharegpio = <1>;
+
+		wlan2g {
+			label = "tenda:green:wlan2g";
+			gpios = <&gpio0 24 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		wlan5g {
+			label = "tenda:green:wlan5g";
+			gpios = <&gpio0 20 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		power-red {
+			label = "tenda:red:power";
+			gpios = <&gpio0 0 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		power-green {
+			label = "tenda:green:power";
+			gpios = <&gpio0 1 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+		};
+
+		wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&gpio0 18 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	board {
+		compatible = "tri,board";
+		usb_power = <27>;
+		current_limit = <28>;
+
+		tr5220;
+		pcie2_0;
+		pcie_rstn    = <16>;
+		vol_en       = <9>;
+		wl_en        = <10>;
+		pmu_pwron    = <11>;
+
+		rgmii;
+		extphy;
+		jtag_sel;
+	};
+
+	fmc@10a20000 {
+		compatible = "tri,fmc";
+		bus_id = "fmc";
+		reg = <0x10a20000 0x1000>,
+		      <0x1c000000 0x100000>;
+		spi_cs = <0x1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/* Boot ROM */
+			esbc {
+				label = "esbc";
+				reg = <0x000000 0x040000>;
+				read-only;
+			};
+
+			/* U-Boot bootloader */
+			uboot {
+				label = "uboot";
+				reg = <0x040000 0x080000>;
+				read-only;
+			};
+
+			/* U-Boot environment */
+			enva {
+				label = "enva";
+				reg = <0x0c0000 0x010000>;
+			};
+
+			/* Irreplaceable factory Wi-Fi RF calibration */
+			equip: factory {
+				label = "equip";
+				reg = <0x0d0000 0x040000>;
+				read-only;
+			};
+
+			/* OpenWrt firmware (kernel + rootfs) - ~14.5 MB */
+			firmware {
+				label = "firmware";
+				reg = <0x110000 0x0e88000>;
+			};
+
+			/* Tenda config / backup region */
+			cfg {
+				label = "cfg";
+				reg = <0xf98000 0x068000>;
+			};
+		};
+	};
+};
+
+&halport0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			label = "wan";
+			phy-mode = "internal";
+			phy-handle = <&phy1>;
+		};
+		port@1 {
+			reg = <1>;
+			label = "lan1";
+			phy-mode = "internal";
+			phy-handle = <&phy2>;
+		};
+		port@2 {
+			reg = <2>;
+			label = "lan2";
+			phy-mode = "internal";
+			phy-handle = <&phy3>;
+		};
+		port@3 {
+			reg = <3>;
+			label = "lan3";
+			phy-mode = "internal";
+			phy-handle = <&phy4>;
+		};
+		port@4 {
+			reg = <4>;
+			label = "lan4";
+			phy-mode = "internal";
+			phy-handle = <&phy5>;
+		};
+	};
+};
+
+/*
+ * TR6560 SMP release register.
+ *
+ * The BSP dtsi sets smp-offset = <0xc08>, but retail 5.10.201 (hsan_smp)
+ * writes the secondary-core entry point (secondary_startup phys) to
+ * sysctrl + 0xc00 before clearing the CPU1 reset bits in CRG+0x38
+ * (bits 23|25) and sending the wakeup IPI.  With 0xc08 the vendor
+ * tri_boot_secondary() writes the address to the wrong register and
+ * CPU1 times out ("CPU1: failed to come online").
+ * Verified against retail: sysctrl+0xc00 = secondary_startup phys
+ * (0x80609680 there), table at VA 0xC0C0B440 = {22,24},{23,25}.
+ */
+&sysctrl {
+	smp-offset = <0xc00>;
+};

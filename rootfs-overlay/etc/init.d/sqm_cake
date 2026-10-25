@@ -1,0 +1,48 @@
+#!/bin/sh /etc/rc.common
+# CAKE SQM on the WISP uplink (wlan0).
+#   download: ingress redirect -> ifb0 -> cake
+#   upload:   cake on wlan0 egress
+# Rates are fixed; the WISP link varies, so tune RATE_DOWN/RATE_UP or add
+# an autorate script later.
+START=95
+STOP=10
+
+RATE_DOWN=36mbit
+RATE_UP=16mbit
+
+start() {
+	# wlan0 is created by wifi_pre; wait briefly if rc order ever changes
+	local i=0
+	while [ $i -lt 20 ] && [ ! -e /sys/class/net/wlan0 ]; do
+		sleep 1; i=$((i + 1))
+	done
+	[ -e /sys/class/net/wlan0 ] || { logger -t sqm_cake "wlan0 missing"; return 0; }
+
+	insmod /lib/modules/5.10.138/sch_cake.ko 2>/dev/null
+	modprobe ifb 2>/dev/null
+	modprobe cls_matchall 2>/dev/null
+	modprobe act_mirred 2>/dev/null
+
+	ip link add ifb0 type ifb 2>/dev/null
+	ip link set ifb0 up
+
+	tc qdisc del dev wlan0 ingress 2>/dev/null
+	tc qdisc add dev wlan0 handle ffff: ingress
+	tc filter add dev wlan0 parent ffff: protocol all matchall \
+		action mirred egress redirect dev ifb0
+
+	tc qdisc del dev ifb0 root 2>/dev/null
+	tc qdisc add dev ifb0 root cake bandwidth "$RATE_DOWN" nat
+	tc qdisc del dev wlan0 root 2>/dev/null
+	tc qdisc add dev wlan0 root cake bandwidth "$RATE_UP" nat
+
+	logger -t sqm_cake "cake up: down $RATE_DOWN up $RATE_UP"
+}
+
+stop() {
+	tc qdisc del dev wlan0 ingress 2>/dev/null
+	tc qdisc del dev wlan0 root 2>/dev/null
+	tc qdisc del dev ifb0 root 2>/dev/null
+	ip link del ifb0 2>/dev/null
+	logger -t sqm_cake "cake down"
+}

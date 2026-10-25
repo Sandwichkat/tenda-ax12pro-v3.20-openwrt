@@ -1,0 +1,14 @@
+--- a/configure.py
++++ b/configure.py
+@@ -23,7 +23,10 @@
+ 
+ from optparse import OptionParser
+ import os
+-import pipes
++try:
++    import pipes
++except ImportError:
++    import shlex as pipes
+ import string
+ import subprocess
+ import sys
